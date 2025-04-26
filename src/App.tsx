@@ -1,18 +1,80 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer, CartesianGrid } from "recharts";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Upload } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from '@tauri-apps/plugin-dialog';
+import { listen } from "@tauri-apps/api/event";
 import type { RowData } from "@/types/rowData";
 
+
+
+
+// import React, { useState, useEffect, useRef } from "react";
+// import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer, CartesianGrid } from "recharts";
+// import { Card, CardContent } from "@/components/ui/card";
+// import { Checkbox } from "@/components/ui/checkbox";
+// import { Upload } from "lucide-react";
+// import { open } from "@tauri-apps/api/dialog";
+// import { invoke } from "@tauri-apps/api/core";
+// import { listen } from "@tauri-apps/api/event";
+// import type { RowData } from "@/types/rowData";
+
 export default function ExcelGraphApp() {
+  const [headers, setHeaders] = useState<string[]>([]);
   const [data, setData] = useState<any[]>([]);
-  const [columns, setColumns] = useState<string[]>([]);
   const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
   const [xAxisColumn, setXAxisColumn] = useState<string>("idx");
   const [loading, setLoading] = useState<boolean>(false);
+
+  const tempBuffer = useRef<any[]>([]); // incoming rows buffer
+  const flushing = useRef<boolean>(false); // prevent multiple flush loops
+
+  useEffect(() => {
+    const unlistenHeaders = listen<string[]>("parsed_headers", (event) => {
+      setHeaders(event.payload);
+      setData([]);
+      tempBuffer.current = []; // clear buffer
+    });
+
+    const unlistenRows = listen<RowData[]>("parsed_rows_batch", (event) => {
+      const newRows = event.payload.map((row) => {
+        const obj: { [key: string]: any } = {};
+        headers.forEach((header, i) => {
+          const val = row.fields[i];
+          obj[header] = val === undefined ? null : (isNaN(Number(val)) ? val : Number(val));
+        });
+        return obj;
+      });
+      tempBuffer.current.push(...newRows);
+
+      if (!flushing.current) {
+        startFlushing();
+      }
+    });
+
+    return () => {
+      unlistenHeaders.then((f) => f());
+      unlistenRows.then((f) => f());
+    };
+  }, [headers]);
+
+  const startFlushing = () => {
+    flushing.current = true;
+    const flushInterval = setInterval(() => {
+      if (tempBuffer.current.length === 0) {
+        clearInterval(flushInterval);
+        flushing.current = false;
+        return;
+      }
+
+      setData(prev => {
+        const chunk = tempBuffer.current.splice(0, 500); // flush 500 at a time
+        return [...prev, ...chunk];
+      });
+    }, 250); // flush every 250ms
+  };
 
   const handleOpenFile = async () => {
     const selected = await open({
@@ -25,32 +87,9 @@ export default function ExcelGraphApp() {
     if (typeof selected === "string") {
       setLoading(true);
       try {
-        const rows = await invoke<RowData[]>("parse_file", { filepath: selected });
-
-        if (!rows.length) {
-          setData([]);
-          setColumns([]);
-          setSelectedColumns([]);
-          return;
-        }
-
-        // Transform Rust format { fields: ["a", "b", "c"] } into objects
-        const headers = rows[0].fields;
-        const bodyRows = rows.slice(1);
-
-        const jsonData = bodyRows.map((row, idx) => {
-          const obj: { [key: string]: any } = { idx };
-          headers.forEach((header, i) => {
-            const val = row.fields[i];
-            obj[header] = val === undefined ? null : (isNaN(Number(val)) ? val : Number(val));
-          });
-          return obj;
-        });
-
-        setData(jsonData);
-        setColumns(headers);
-        setSelectedColumns([]);
+        await invoke("parse_file_stream", { filepath: selected });
         setXAxisColumn("idx");
+        setSelectedColumns([]);
       } catch (error) {
         console.error("Failed to load file:", error);
       } finally {
@@ -88,7 +127,7 @@ export default function ExcelGraphApp() {
           onChange={(e) => setXAxisColumn(e.target.value)}
         >
           <option value="idx">Index</option>
-          {columns.map((col, idx) => (
+          {headers.map((col, idx) => (
             <option key={idx} value={col}>
               {col}
             </option>
@@ -96,7 +135,7 @@ export default function ExcelGraphApp() {
         </select>
 
         <div className="text-white mb-2 font-semibold">Select Data Series:</div>
-        {columns.map((col, idx) => (
+        {headers.map((col, idx) => (
           col !== xAxisColumn && (
             <div key={idx} className="flex items-center mb-2">
               <Checkbox
@@ -113,7 +152,6 @@ export default function ExcelGraphApp() {
       <div className="w-3/4 p-4">
         <Card className="h-full backdrop-blur-md bg-white/10 rounded-2xl shadow-lg">
           <CardContent className="h-full flex items-center justify-center">
-            {/* Loading or empty state */}
             {data.length === 0 || loading ? (
               <div className="flex flex-col items-center justify-center text-gray-400 text-center">
                 <Upload size={64} className="text-blue-400 mb-4" />
@@ -121,9 +159,7 @@ export default function ExcelGraphApp() {
               </div>
             ) : (
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart
-                  data={data}
-                >
+                <LineChart data={data}>
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
                   <XAxis dataKey={xAxisColumn} stroke="#ccc" />
                   <YAxis stroke="#ccc" />
@@ -153,3 +189,4 @@ export default function ExcelGraphApp() {
     </div>
   );
 }
+

@@ -1,4 +1,8 @@
 export interface RowData {
-    fields: string[];
-  }
-  
+  fields: string[];
+}
+
+export interface ParsedFileResult {
+  headers: string[];
+  rows: RowData[];
+}
