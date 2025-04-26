@@ -27,15 +27,22 @@ export default function ExcelGraphApp() {
   const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
   const [xAxisColumn, setXAxisColumn] = useState<string>("idx");
   const [loading, setLoading] = useState<boolean>(false);
+  const [loadingPoints, setLoadingPoints] = useState<number>(0);
+  const [totalPoints, setTotalPoints] = useState<number>(0);
+  const [finishedLoading, setFinishedLoading] = useState<boolean>(false);
 
-  const tempBuffer = useRef<any[]>([]); // incoming rows buffer
-  const flushing = useRef<boolean>(false); // prevent multiple flush loops
+  const tempBuffer = useRef<any[]>([]);
+  const flushing = useRef<boolean>(false);
 
   useEffect(() => {
     const unlistenHeaders = listen<string[]>("parsed_headers", (event) => {
       setHeaders(event.payload);
       setData([]);
-      tempBuffer.current = []; // clear buffer
+      tempBuffer.current = [];
+    });
+
+    const unlistenTotalRows = listen<number>("parsed_total_rows", (event) => {
+      setTotalPoints(event.payload);
     });
 
     const unlistenRows = listen<RowData[]>("parsed_rows_batch", (event) => {
@@ -56,6 +63,7 @@ export default function ExcelGraphApp() {
 
     return () => {
       unlistenHeaders.then((f) => f());
+      unlistenTotalRows.then((f) => f());
       unlistenRows.then((f) => f());
     };
   }, [headers]);
@@ -86,6 +94,8 @@ export default function ExcelGraphApp() {
 
     if (typeof selected === "string") {
       setLoading(true);
+      setFinishedLoading(false);
+      setLoadingPoints(0);
       try {
         await invoke("parse_file_stream", { filepath: selected });
         setXAxisColumn("idx");
@@ -93,10 +103,11 @@ export default function ExcelGraphApp() {
       } catch (error) {
         console.error("Failed to load file:", error);
       } finally {
-        setLoading(false);
+        setLoading(false); // Loading file **command** complete (parsing still progressive)
       }
     }
   };
+
 
   const handleCheckboxChange = (col: string) => {
     setSelectedColumns(prev =>
@@ -178,6 +189,7 @@ export default function ExcelGraphApp() {
                       dot={{ r: 0 }}
                       activeDot={{ r: 1 }}
                       strokeWidth={1}
+                      strokeOpacity={finishedLoading ? 1 : 0.5} // 👈 Dynamic opacity
                     />
                   ))}
                 </LineChart>
@@ -186,6 +198,20 @@ export default function ExcelGraphApp() {
           </CardContent>
         </Card>
       </div>
+      {!finishedLoading && totalPoints > 0 && (
+        <div className="absolute bottom-4 left-4 right-4">
+          <div className="w-full h-2 bg-gray-700 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-blue-500 transition-all duration-300"
+              style={{ width: `${(loadingPoints / totalPoints) * 100}%` }}
+            />
+          </div>
+          <div className="text-center text-xs text-gray-400 mt-1">
+            {Math.min(100, Number(((loadingPoints / totalPoints) * 100).toFixed(1)))}% loaded
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

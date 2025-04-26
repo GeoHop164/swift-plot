@@ -47,7 +47,8 @@ async fn parse_file_stream(filepath: String, window: Window) -> Result<(), Strin
     window
         .emit("parsed_headers", parsed.headers)
         .map_err(|e| format!("Failed to emit headers: {}", e))?;
-
+    window.emit("parsed_total_rows", parsed.rows.len())
+    .map_err(|e| format!("Failed to emit total rows: {}", e))?;
     let batch_size = 500;
     let mut batch = Vec::new();
 
