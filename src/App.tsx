@@ -9,6 +9,9 @@ import type { RowData } from "@/types/rowData";
 import ReactECharts from "echarts-for-react";
 
 export default function ExcelGraphApp() {
+	const [fileName, setFileName] = useState<string>(
+		"Upload a Data File to Begin"
+	);
 	const [headers, setHeaders] = useState<string[]>([]);
 	const [fullData, setFullData] = useState<any[]>([]);
 	const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
@@ -91,6 +94,10 @@ export default function ExcelGraphApp() {
 
 		if (typeof selected === "string") {
 			setLoading(true);
+			const parts = selected.split(/[\/\\]/); // regex for both / and \
+			const name = parts[parts.length - 1];
+			setFileName(name);
+
 			setFinishedLoading(false);
 			setLoadingPoints(0);
 			try {
@@ -197,25 +204,23 @@ export default function ExcelGraphApp() {
 					Upload File
 				</button>
 
-				
-
 				{finishedLoading && (
 					<>
-          <div className="text-white mb-4 font-semibold">
-					Select X-Axis:
-				</div>
-				<select
-					className="w-full mb-6 p-2 rounded-lg bg-gray-700 text-white border border-gray-600"
-					value={xAxisColumn}
-					onChange={(e) => setXAxisColumn(e.target.value)}
-				>
-					<option value="idx">Index</option>
-					{headers.map((col, idx) => (
-						<option key={idx} value={col}>
-							{col}
-						</option>
-					))}
-				</select>
+						<div className="text-white mb-4 font-semibold">
+							Select X-Axis:
+						</div>
+						<select
+							className="w-full mb-6 p-2 rounded-lg bg-gray-700 text-white border border-gray-600"
+							value={xAxisColumn}
+							onChange={(e) => setXAxisColumn(e.target.value)}
+						>
+							<option value="idx">(Index)</option>
+							{headers.map((col, idx) => (
+								<option key={idx} value={col}>
+									{col}
+								</option>
+							))}
+						</select>
 						<div className="text-white mb-2 font-semibold">
 							Select Data Series:
 						</div>
@@ -247,27 +252,36 @@ export default function ExcelGraphApp() {
 			{/* Chart area */}
 			<div className="w-3/4 p-4 relative">
 				<Card className="h-full backdrop-blur-md bg-white/10 rounded-2xl shadow-lg">
-					<CardContent className="h-full flex items-center justify-center">
-						{fullData.length === 0 || loading ? (
-							<div className="flex flex-col items-center justify-center text-gray-400 text-center">
-								<Upload
-									size={64}
-									className="text-blue-400 mb-4"
+					<CardContent className="h-full flex flex-col p-4">
+						{/* Title at top */}
+						<div className="text-xl font-bold text-center text-white mb-4 transition-all duration-300">
+							{fileName}
+						</div>
+
+						{/* Chart area */}
+						<div className="flex-1 flex items-center justify-center">
+							{/* Chart or Upload Prompt */}
+							{fullData.length === 0 || loading ? (
+								<div className="flex flex-col items-center justify-center text-gray-400 text-center">
+									<Upload
+										size={64}
+										className="text-blue-400 mb-4"
+									/>
+									<p className="text-lg">
+										{loading
+											? "Loading file..."
+											: "Upload an Excel or CSV file"}
+									</p>
+								</div>
+							) : (
+								<ReactECharts
+									style={{ height: "100%", width: "100%" }}
+									option={getChartOptions()}
+									notMerge={true}
+									lazyUpdate={true}
 								/>
-								<p className="text-lg">
-									{loading
-										? "Loading file..."
-										: "Upload an Excel or CSV file"}
-								</p>
-							</div>
-						) : (
-							<ReactECharts
-								style={{ height: "100%", width: "100%" }}
-								option={getChartOptions()}
-								notMerge={true}
-								lazyUpdate={true}
-							/>
-						)}
+							)}
+						</div>
 					</CardContent>
 				</Card>
 
