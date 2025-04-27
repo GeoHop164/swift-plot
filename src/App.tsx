@@ -8,19 +8,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { RowData } from "@/types/rowData";
 
-
-
-
-// import React, { useState, useEffect, useRef } from "react";
-// import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer, CartesianGrid } from "recharts";
-// import { Card, CardContent } from "@/components/ui/card";
-// import { Checkbox } from "@/components/ui/checkbox";
-// import { Upload } from "lucide-react";
-// import { open } from "@tauri-apps/api/dialog";
-// import { invoke } from "@tauri-apps/api/core";
-// import { listen } from "@tauri-apps/api/event";
-// import type { RowData } from "@/types/rowData";
-
 export default function ExcelGraphApp() {
   const [headers, setHeaders] = useState<string[]>([]);
   const [data, setData] = useState<any[]>([]);
@@ -78,10 +65,10 @@ export default function ExcelGraphApp() {
       }
 
       setData(prev => {
-        const chunk = tempBuffer.current.splice(0, 500); // flush 500 at a time
+        const chunk = tempBuffer.current.splice(0, 500);
         return [...prev, ...chunk];
       });
-    }, 250); // flush every 250ms
+    }, 250); 
   };
 
   const handleOpenFile = async () => {
@@ -103,7 +90,7 @@ export default function ExcelGraphApp() {
       } catch (error) {
         console.error("Failed to load file:", error);
       } finally {
-        setLoading(false); // Loading file **command** complete (parsing still progressive)
+        setLoading(false);
       }
     }
   };
@@ -189,7 +176,7 @@ export default function ExcelGraphApp() {
                       dot={{ r: 0 }}
                       activeDot={{ r: 1 }}
                       strokeWidth={1}
-                      strokeOpacity={finishedLoading ? 1 : 0.5} // 👈 Dynamic opacity
+                      strokeOpacity={finishedLoading ? 1 : 0.5}
                     />
                   ))}
                 </LineChart>
