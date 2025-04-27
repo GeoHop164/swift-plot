@@ -35,9 +35,9 @@ Tested and working on:
 
 ## Known Issues
 
-- You sometimes have to import a data file twice
-- The progress indicator doesn't work
-- Large data files still cause lag
+- You sometimes have to import a data file twice, otherwise data may be missing
+- ~~The progress indicator doesn't work~~ Fixed!
+- ~~Large data files still cause lag~~ As fixed as I'm going to put effort into
 
 ## Current limitations
 
