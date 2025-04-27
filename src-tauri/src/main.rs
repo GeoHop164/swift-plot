@@ -43,7 +43,6 @@ async fn parse_file_stream(filepath: String, window: Window) -> Result<(), Strin
         return Err("Unsupported file format.".into());
     };
 
-    // Send headers first
     window
         .emit("parsed_headers", parsed.headers)
         .map_err(|e| format!("Failed to emit headers: {}", e))?;
