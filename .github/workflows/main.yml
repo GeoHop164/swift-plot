@@ -1,5 +1,6 @@
 name: Build Tauri App for Windows
 
+
 on:
   push:
     branches:
