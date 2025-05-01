@@ -1,4 +1,4 @@
-name: Build Tauri App for Windows
+name: Build Windows Binaries
 
 on:
   push:
@@ -20,13 +20,14 @@ jobs:
 
       - name: Install Node.js
         run: |
-          curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-          sudo apt-get install -y nodejs
+          Invoke-WebRequest -Uri https://nodejs.org/dist/v18.19.1/node-v18.19.1-x64.msi -OutFile node.msi
+          Start-Process msiexec.exe -Wait -ArgumentList '/i', 'node.msi', '/quiet', '/norestart'
 
       - name: Install Rust
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          Invoke-WebRequest -Uri https://win.rustup.rs/ -OutFile rustup-init.exe
+          Start-Process -Wait -FilePath .\rustup-init.exe -ArgumentList "-y"
+          $env:PATH += ";$env:USERPROFILE\.cargo\bin"
 
       - name: Install frontend dependencies
         run: npm install
@@ -35,13 +36,13 @@ jobs:
         run: npm run build
 
       - name: Install Tauri CLI
-        run: ~/.cargo/bin/cargo install tauri-cli
+        run: cargo install tauri-cli
 
       - name: Build Tauri app
-        run: ~/.cargo/bin/tauri build
+        run: npm run tauri build
 
       - name: Upload Tauri artifacts
         uses: actions/upload-artifact@v4
         with:
           name: tauri-windows-build
-          path: src-tauri/target/release/bundle
+          path: src-tauri\target\release\bundle
