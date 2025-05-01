@@ -19,11 +19,13 @@ jobs:
           git checkout ${{ github.ref }}
 
       - name: Install Node.js
+        continue-on-error: true
         run: |
           Invoke-WebRequest -Uri https://nodejs.org/dist/v18.19.1/node-v18.19.1-x64.msi -OutFile node.msi
           Start-Process msiexec.exe -Wait -ArgumentList '/i', 'node.msi', '/quiet', '/norestart'
 
       - name: Install Rust
+        continue-on-error: true
         run: |
           Invoke-WebRequest -Uri https://win.rustup.rs/ -OutFile rustup-init.exe
           Start-Process -Wait -FilePath .\rustup-init.exe -ArgumentList "-y"
