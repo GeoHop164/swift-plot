@@ -45,3 +45,7 @@ Tested and working on:
 - Only one y-axis scale
 - Only CSV and Excel files
 - No ability to export (you can just screenshot for now)
+
+## Has this project helped you out?
+
+[<img src="https://cdn.buymeacoffee.com/buttons/default-black.png" style="width:300px; border-radius: 25px">](https://coff.ee/geohop164)
