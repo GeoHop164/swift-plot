@@ -3,233 +3,283 @@
     windows_subsystem = "windows"
 )]
 
-use calamine::{open_workbook_auto, Reader};
+use calamine::{open_workbook_auto, Data, Reader, Sheets};
 use csv::ReaderBuilder;
-use once_cell::sync::Lazy;
-use regex::Regex;
+use log::info;
 use serde::Serialize;
 use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
-use tauri::{Manager, Window, Emitter};
+use std::time::Instant;
+use tauri::Manager;
 
-#[derive(Serialize, Clone)]
+// --- Existing Structs (for reference, load_file_fully is kept but unused by UI) ---
+#[derive(Serialize, Clone, Debug)]
 struct RowData {
-    fields: Vec<String>,
+    fields: Vec<serde_json::Value>,
 }
 
-#[derive(Serialize)]
-struct ParsedFileResult {
+#[derive(Serialize, Clone, Debug)]
+struct FullDataPayload {
     headers: Vec<String>,
     rows: Vec<RowData>,
+    total_rows: usize,
 }
 
+// --- New Structs for On-Demand Loading ---
+
+/// Overview of a file, containing metadata like headers and sheet names.
+#[derive(Serialize, Clone, Debug)]
+struct FileOverview {
+    headers: Vec<String>,
+    sheets: Option<Vec<String>>,
+    approx_rows: Option<usize>,
+}
+
+/// A chunk of data for a single column.
+#[derive(Serialize, Clone, Debug)]
+struct ColumnChunk {
+    column: String,
+    offset: usize,
+    values: Vec<serde_json::Value>,
+    done: bool,
+}
+
+// --- New Tauri Commands for On-Demand Loading ---
+
+/// Opens a file and returns its metadata without loading the full content.
 #[tauri::command]
-async fn parse_file_stream(filepath: String, window: Window) -> Result<(), String> {
+fn open_file_overview(filepath: String) -> Result<FileOverview, String> {
+    let start_time = Instant::now();
+    info!("Opening file overview for: {}", filepath);
+
     let path = Path::new(&filepath);
     if !path.exists() {
         return Err("File does not exist.".into());
     }
 
-    let extension = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
 
-    let parsed = if extension == "csv" {
-        parse_csv(filepath)?
-    } else if extension == "xlsx" || extension == "xls" {
-        parse_excel(filepath)?
-    } else {
-        return Err("Unsupported file format.".into());
+    let result = match extension.as_str() {
+        "csv" => {
+            let mut rdr = ReaderBuilder::new().has_headers(true).from_path(&filepath).map_err(|e| e.to_string())?;
+            let headers = rdr.headers().map_err(|e| e.to_string())?.iter().map(String::from).collect();
+            Ok(FileOverview {
+                headers,
+                sheets: None,
+                approx_rows: None,
+            })
+        }
+        "xlsx" | "xls" => {
+            let mut workbook: Sheets<BufReader<File>> = open_workbook_auto(&filepath).map_err(|e| e.to_string())?;
+            let sheet_names = workbook.sheet_names().to_owned();
+            if sheet_names.is_empty() {
+                return Err("No sheets found in the workbook.".into());
+            }
+            let first_sheet_name = &sheet_names[0];
+            let range = workbook.worksheet_range(first_sheet_name).map_err(|e| e.to_string())?;
+            let headers = range.rows().next()
+                .map(|r| r.iter().map(excel_cell_to_string).collect())
+                .unwrap_or_else(Vec::new);
+
+            Ok(FileOverview {
+                headers,
+                sheets: Some(sheet_names),
+                approx_rows: Some(range.height().saturating_sub(1)), // Subtract header row
+            })
+        }
+        _ => Err("Unsupported file format.".into()),
     };
 
-    window
-        .emit("parsed_headers", parsed.headers.clone())
-        .map_err(|e| format!("Failed to emit headers: {}", e))?;
+    info!("File overview completed in {:?}", start_time.elapsed());
+    result
+}
 
-    window
-        .emit("parsed_total_rows", parsed.rows.len())
-        .map_err(|e| format!("Failed to emit total rows: {}", e))?;
+/// Loads a chunk of data for a specific column.
+#[tauri::command]
+fn load_column_chunk(filepath: String, column: String, sheet: Option<String>, offset: usize, limit: usize) -> Result<ColumnChunk, String> {
+    let start_time = Instant::now();
+    info!("Loading chunk for column '{}' in '{}' [offset: {}, limit: {}]", column, filepath, offset, limit);
 
-    let batch_size = 500;
-    let mut batch = Vec::with_capacity(batch_size);
-    let total_rows = parsed.rows.len();
+    if limit == 0 {
+        return Ok(ColumnChunk { column, offset, values: vec![], done: true });
+    }
 
-    for (idx, row) in parsed.rows.into_iter().enumerate() {
-        batch.push(row);
-        if batch.len() >= batch_size || idx == total_rows - 1 {
-            window
-                .emit("parsed_rows_batch", batch.clone())
-                .map_err(|e| format!("Failed to emit batch: {}", e))?;
-            batch.clear();
+    let path = Path::new(&filepath);
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+
+    let result = match extension.as_str() {
+        "csv" => load_csv_column_chunk(&filepath, &column, offset, limit),
+        "xlsx" | "xls" => load_excel_column_chunk(&filepath, &column, sheet, offset, limit),
+        _ => Err("Unsupported file format.".into()),
+    };
+    
+    info!("Column chunk loaded in {:?}", start_time.elapsed());
+    result
+}
+
+// --- Helper Functions for Column Loading ---
+
+fn load_csv_column_chunk(filepath: &str, column: &str, offset: usize, limit: usize) -> Result<ColumnChunk, String> {
+    let mut rdr = ReaderBuilder::new().has_headers(true).from_path(filepath).map_err(|e| e.to_string())?;
+    let headers = rdr.headers().map_err(|e| e.to_string())?;
+    let col_idx = headers.iter().position(|h| h == column)
+        .ok_or_else(|| format!("Column '{}' not found in CSV.", column))?;
+
+    let mut values = Vec::with_capacity(limit.min(10000)); // Cap initial capacity
+    let mut records_iter = rdr.records().skip(offset);
+
+    for _ in 0..limit {
+        match records_iter.next() {
+            Some(Ok(record)) => {
+                let val_str = record.get(col_idx).unwrap_or("");
+                
+                let json_val = if val_str.is_empty() {
+                    serde_json::Value::Null
+                } else if let Ok(n) = val_str.trim().parse::<f64>() {
+                    serde_json::Value::from(n)
+                } else {
+                    serde_json::Value::String(val_str.to_string())
+                };
+                values.push(json_val);
+            }
+            Some(Err(e)) => return Err(format!("CSV parsing error: {}", e)),
+            None => break,
         }
     }
 
-    Ok(())
+    let done = values.len() < limit;
+
+    Ok(ColumnChunk {
+        column: column.to_string(),
+        offset,
+        values,
+        done,
+    })
 }
 
-fn parse_csv(filepath: String) -> Result<ParsedFileResult, String> {
-    let file = File::open(filepath).map_err(|e| e.to_string())?;
-    let mut reader = ReaderBuilder::new().has_headers(true).from_reader(file);
+fn load_excel_column_chunk(filepath: &str, column: &str, sheet: Option<String>, offset: usize, limit: usize) -> Result<ColumnChunk, String> {
+    let mut workbook: Sheets<BufReader<File>> = open_workbook_auto(filepath).map_err(|e| e.to_string())?;
+    
+    let sheet_name = sheet.or_else(|| workbook.sheet_names().get(0).cloned())
+        .ok_or("No sheets found in workbook.")?;
 
-    let headers = reader
-        .headers()
-        .map_err(|e| e.to_string())?
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<String>>();
+    let range = workbook.worksheet_range(&sheet_name)
+        .map_err(|e| format!("Could not read sheet '{}': {}", sheet_name, e))?;
 
+    let headers = range.rows().next()
+        .ok_or(format!("Sheet '{}' is empty.", sheet_name))?;
+        
+    let col_idx = headers.iter().position(|c| excel_cell_to_string(c) == column)
+        .ok_or_else(|| format!("Column '{}' not found in sheet '{}'.", column, sheet_name))?;
+
+    let values: Vec<serde_json::Value> = range.rows()
+        .skip(1) // Skip header
+        .skip(offset)
+        .take(limit)
+        .map(|row| {
+            let cell = row.get(col_idx).unwrap_or(&Data::Empty);
+            excel_cell_to_json(cell)
+        })
+        .collect();
+    
+    let done = values.len() < limit;
+
+    Ok(ColumnChunk {
+        column: column.to_string(),
+        offset,
+        values,
+        done,
+    })
+}
+
+// --- Existing Full Load Command (Unused by UI) ---
+#[tauri::command]
+async fn load_file_fully(filepath: String) -> Result<FullDataPayload, String> {
+    let start_time = Instant::now();
+    info!("(Legacy) Starting full file load for: {}", filepath);
+    let path = Path::new(&filepath);
+    if !path.exists() { return Err("File does not exist.".into()); }
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let result = if extension == "csv" { load_csv(&filepath) } else if extension == "xlsx" || extension == "xls" { load_excel(&filepath) } else { Err("Unsupported file format.".into()) };
+    info!("(Legacy) Total processing time for {}: {:?}", filepath, start_time.elapsed());
+    result
+}
+
+fn load_csv(filepath: &str) -> Result<FullDataPayload, String> {
+    let mut reader = ReaderBuilder::new().has_headers(true).from_path(filepath).map_err(|e| e.to_string())?;
+    let headers = reader.headers().map_err(|e| e.to_string())?.iter().map(String::from).collect::<Vec<String>>();
     let mut rows = Vec::new();
     for result in reader.records() {
         let record = result.map_err(|e| e.to_string())?;
-        let fields = record.iter().map(|s| s.to_string()).collect();
+        let fields = record.iter().map(|s| serde_json::Value::String(s.to_string())).collect();
         rows.push(RowData { fields });
     }
-
-    let flags = detect_duration_columns(headers.len(), &rows);
-    let rows = convert_duration_columns(rows, &flags);
-
-    Ok(ParsedFileResult { headers, rows })
+    Ok(FullDataPayload { total_rows: rows.len(), headers, rows })
 }
 
-
-fn excel_cell_to_string_seconds(cell: &calamine::Data) -> String {
-    match cell {
-        calamine::Data::String(s) => s.clone(),
-        calamine::Data::Float(f) => f.to_string(),
-        calamine::Data::Int(i) => i.to_string(),
-        calamine::Data::Bool(b) => b.to_string(),
-
-        // ExcelDateTime -> seconds since Excel's 0-day (days * 86400)
-        calamine::Data::DateTime(dt) => {
-            let secs = dt.as_f64() * 86_400.0; // convert Excel serial days to seconds
-            format!("{:.6}", secs)
-        }
-
-        // Optional: if you want to handle ISO8601 duration strings directly:
-        calamine::Data::DurationIso(s) => s.clone(), // or parse to seconds if needed
-        calamine::Data::DateTimeIso(s) => s.clone(), // likewise
-
-        _ => String::new(),
-    
-    }}
-
-fn parse_excel(filepath: String) -> Result<ParsedFileResult, String> {
-    let mut workbook =
-        open_workbook_auto(&filepath).map_err(|e| format!("Failed to open file: {}", e))?;
+fn load_excel(filepath: &str) -> Result<FullDataPayload, String> {
+    let mut workbook: Sheets<BufReader<File>> = open_workbook_auto(filepath).map_err(|e| format!("Failed to open file: {}", e))?;
     let sheet_names = workbook.sheet_names().to_owned();
-    if sheet_names.is_empty() {
-        return Err("No sheets found.".into());
-    }
-
-    
-    let range = workbook
-        .worksheet_range(&sheet_names[0])
-        .map_err(|e| format!("Failed to read sheet: {}", e))?;
-
-
-    let mut rows = Vec::new();
-    let mut headers: Vec<String> = vec![];
-    let mut iter = range.rows();
-
-    if let Some(header_row) = iter.next() {
-        headers = header_row.iter().map(excel_cell_to_string_seconds).collect();
-    }
-
-    for row in iter {
-        let fields = row.iter().map(excel_cell_to_string_seconds).collect();
-        rows.push(RowData { fields });
-    }
-
-    let flags = detect_duration_columns(headers.len(), &rows);
-    let rows = convert_duration_columns(rows, &flags);
-
-    Ok(ParsedFileResult { headers, rows })
-}
-
-
-fn parse_duration_to_seconds(s: &str) -> Option<f64> {
-    static RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"(?ix) ^
-                \s*
-                (?: (?P<d>\d+)\s*[dD]\s+ )?        # '2d', '2D', optional
-                (?P<h>\d{1,3}) \s* : \s*           # hours (1–3 digits)
-                (?P<m>\d{2})   \s* : \s*
-                (?P<s>\d{2})
-                (?: \.(?P<ms>\d{1,3}) )?           # optional .ms
-                \s* $
-            ",
-        )
-        .unwrap()
-    });
-
-    if let Some(c) = RE.captures(s) {
-        let d: f64  = c.name("d").and_then(|m| m.as_str().parse().ok()).unwrap_or(0.0);
-        let h: f64  = c.name("h")?.as_str().parse().ok()?;
-        let m: f64  = c.name("m")?.as_str().parse().ok()?;
-        let s2: f64 = c.name("s")?.as_str().parse().ok()?;
-        let ms: f64 = c.name("ms").and_then(|m| m.as_str().parse().ok()).unwrap_or(0.0);
-        Some(d * 86_400.0 + h * 3_600.0 + m * 60.0 + s2 + ms / 1_000.0)
-    } else {
-        None   
-    }
-}
-
-fn detect_duration_columns(headers_len: usize, rows: &[RowData]) -> Vec<bool> {
-    const THRESHOLD: f64 = 0.80;
-    let mut is_duration = vec![false; headers_len];
-
-    for col in 0..headers_len {
-        let mut non_empty = 0usize;
-        let mut parsable = 0usize;
-
-        for r in rows {
-            if col >= r.fields.len() {
-                continue;
-            }
-            let v = r.fields[col].trim();
-            if v.is_empty() {
-                continue;
-            }
-            non_empty += 1;
-            if parse_duration_to_seconds(v).is_some() {
-                parsable += 1;
-            }
-        }
-
-        if non_empty > 0 && (parsable as f64) / (non_empty as f64) >= THRESHOLD {
-            is_duration[col] = true;
+    if sheet_names.is_empty() { return Err("No sheets found in the workbook.".into()); }
+    let first_sheet_name = &sheet_names[0];
+    let headers_range = workbook.worksheet_range(first_sheet_name).map_err(|e| format!("Error reading sheet '{}': {}", first_sheet_name, e))?;
+    let headers = headers_range.rows().next().map(|r| r.iter().map(excel_cell_to_string).collect()).unwrap_or_else(Vec::new);
+    if headers.is_empty() { return Err("Could not read headers from the first sheet.".into()); }
+    let mut all_rows = Vec::new();
+    for sheet_name in sheet_names.iter() {
+        if let Ok(range) = workbook.worksheet_range(sheet_name) {
+            all_rows.extend(range.rows().skip(1).map(|r| RowData { fields: r.iter().map(excel_cell_to_json).collect() }));
         }
     }
-
-    is_duration
+    Ok(FullDataPayload { total_rows: all_rows.len(), headers, rows: all_rows })
 }
 
-fn convert_duration_columns(mut rows: Vec<RowData>, is_duration: &[bool]) -> Vec<RowData> {
-    for r in &mut rows {
-        for (col, conv) in is_duration.iter().enumerate() {
-            if *conv && col < r.fields.len() {
-                if let Some(sec) = parse_duration_to_seconds(&r.fields[col]) {
-                    r.fields[col] = format!("{:.6}", sec);
-                }
-            }
-        }
+// --- Utility Functions ---
+fn excel_cell_to_string(cell: &Data) -> String {
+    match cell {
+        Data::String(s) => s.clone(),
+        Data::Float(f) => f.to_string(),
+        Data::Int(i) => i.to_string(),
+        Data::Bool(b) => b.to_string(),
+        Data::DateTime(dt) => dt.to_string(),
+        Data::DurationIso(s) | Data::DateTimeIso(s) => s.clone(),
+        Data::Error(e) => format!("Error: {:?}", e),
+        Data::Empty => String::new(),
     }
-    rows
 }
 
+fn excel_cell_to_json(cell: &Data) -> serde_json::Value {
+    match cell {
+        Data::String(s) => serde_json::Value::String(s.clone()),
+        Data::Float(f) => serde_json::Value::from(*f),
+        Data::Int(i) => serde_json::Value::from(*i),
+        Data::Bool(b) => serde_json::Value::from(*b),
+        Data::DateTime(dt) => serde_json::Value::String(dt.to_string()),
+        Data::DurationIso(s) | Data::DateTimeIso(s) => serde_json::Value::String(s.clone()),
+        Data::Error(e) => serde_json::Value::String(format!("Error: {:?}", e)),
+        Data::Empty => serde_json::Value::Null,
+    }
+}
+
+// --- Main Application Setup ---
 fn main() {
+    env_logger::init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![parse_file_stream])
+        .invoke_handler(tauri::generate_handler![
+            load_file_fully, // Kept for backward compatibility/reference
+            open_file_overview,
+            load_column_chunk
+        ])
         .setup(|app| {
             #[cfg(debug_assertions)]
             {
-                let window = app.get_webview_window("main").unwrap();
-                window.open_devtools();
+                if let Some(window) = app.get_webview_window("main") {
+                    window.open_devtools();
+                }
             }
             Ok(())
         })

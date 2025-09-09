@@ -1,317 +1,288 @@
-import { useState, useEffect, useRef } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Upload } from "lucide-react";
-import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import type { RowData } from "@/types/rowData";
+import { open } from "@tauri-apps/plugin-dialog";
 import ReactECharts from "echarts-for-react";
+import { Upload } from "lucide-react";
+import { useCallback, useState } from "react";
+
+// --- New Data Contracts for On-Demand Loading ---
+
+interface FileOverview {
+	headers: string[];
+	sheets?: string[] | null;
+	approx_rows?: number | null;
+}
+
+interface ColumnChunk {
+	column: string;
+	offset: number;
+	values: any[];
+	done: boolean;
+}
 
 export default function ExcelGraphApp() {
-	const [fileName, setFileName] = useState<string>(
-		"Upload a Data File to Begin"
-	);
+	const [fileName, setFileName] = useState<string>("Upload a Data File to Begin");
 	const [headers, setHeaders] = useState<string[]>([]);
-	const [fullData, setFullData] = useState<any[]>([]);
 	const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
 	const [xAxisColumn, setXAxisColumn] = useState<string>("idx");
 	const [loading, setLoading] = useState<boolean>(false);
-	const [loadingPoints, setLoadingPoints] = useState<number>(0);
-	const [totalPoints, setTotalPoints] = useState<number>(0);
-	const [finishedLoading, setFinishedLoading] = useState<boolean>(false);
+    const [error, setError] = useState<string | null>(null);
 
-	const tempBuffer = useRef<any[]>([]);
-	const flushing = useRef<boolean>(false);
-
-	useEffect(() => {
-		const unlistenHeaders = listen<string[]>("parsed_headers", (event) => {
-			setHeaders(event.payload);
-			setFullData([]);
-			tempBuffer.current = [];
-		});
-
-		const unlistenTotalRows = listen<number>(
-			"parsed_total_rows",
-			(event) => {
-				setTotalPoints(event.payload);
-			}
-		);
-
-		const unlistenRows = listen<RowData[]>("parsed_rows_batch", (event) => {
-			const newRows = event.payload.map((row) => {
-				const obj: { [key: string]: any } = {};
-				headers.forEach((header, i) => {
-					const val = row.fields[i];
-					obj[header] =
-						val === undefined
-							? null
-							: isNaN(Number(val))
-							? val
-							: Number(val);
-				});
-				return obj;
-			});
-			tempBuffer.current.push(...newRows);
-
-			if (!flushing.current) {
-				startFlushing();
-			}
-		});
-
-		return () => {
-			unlistenHeaders.then((f) => f());
-			unlistenTotalRows.then((f) => f());
-			unlistenRows.then((f) => f());
-		};
-	}, [headers]);
-
-	const startFlushing = () => {
-		flushing.current = true;
-		const flushInterval = setInterval(() => {
-			if (tempBuffer.current.length === 0) {
-				clearInterval(flushInterval);
-				flushing.current = false;
-				setFinishedLoading(true);
-				return;
-			}
-
-			setFullData((prev) => {
-				const chunk = tempBuffer.current.splice(0, 500);
-				setLoadingPoints((prev) => prev + chunk.length);
-				return [...prev, ...chunk];
-			});
-		}, 250);
-	};
+    // --- New State for On-Demand Loading ---
+    const [columns, setColumns] = useState<Record<string, any[]>>({});
+    const [rowCount, setRowCount] = useState<number | null>(null);
+    const [currentFile, setCurrentFile] = useState<string | null>(null);
+    const [currentSheet, setCurrentSheet] = useState<string | null>(null);
 
 	const handleOpenFile = async () => {
 		const selected = await open({
 			multiple: false,
-			filters: [
-				{ name: "Excel or CSV", extensions: ["csv", "xlsx", "xls"] },
-			],
+			filters: [{ name: "Excel or CSV", extensions: ["csv", "xlsx", "xls"] }],
 		});
 
-		if (typeof selected === "string") {
-			setLoading(true);
-			const parts = selected.split(/[\/\\]/); // regex for both / and \
-			const name = parts[parts.length - 1];
-			setFileName(name);
+		if (typeof selected !== "string") {
+			return; // User cancelled
+		}
 
-			setFinishedLoading(false);
-			setLoadingPoints(0);
-			try {
-				await invoke("parse_file_stream", { filepath: selected });
-				setXAxisColumn("idx");
-				setSelectedColumns([]);
-			} catch (error) {
-				console.error("Failed to load file:", error);
-			} finally {
-				setLoading(false);
-			}
+		setLoading(true);
+        setError(null);
+		const parts = selected.split(/[/\\]/);
+		const name = parts[parts.length - 1];
+		setFileName(name);
+
+        // Reset all data state
+        setHeaders([]);
+        setSelectedColumns([]);
+        setColumns({});
+        setRowCount(null);
+        setCurrentFile(selected);
+        setCurrentSheet(null);
+        setXAxisColumn("idx");
+
+		try {
+			// 1. Invoke the new overview command
+			const overview = await invoke<FileOverview>("open_file_overview", {
+				filepath: selected,
+			});
+            
+            // 2. Update state with metadata
+			setHeaders(overview.headers);
+			setRowCount(overview.approx_rows ?? null);
+            setCurrentSheet(overview.sheets?.[0] ?? null); // Default to first sheet for Excel
+
+		} catch (err: any) {
+			console.error("Failed to get file overview:", err);
+            setError(typeof err === 'string' ? err : "An unknown error occurred during file inspection.");
+            setFileName("Failed to load file. Please try again.");
+		} finally {
+			setLoading(false);
 		}
 	};
 
-	const handleCheckboxChange = (col: string) => {
+    // Helper to load a full column from the backend in chunks
+    const ensureColumnLoaded = useCallback(async (filepath: string, col: string, sheet?: string | null) => {
+        if (!filepath || columns[col]) return; // Already loaded or no file selected
+
+        console.log(`Loading column: ${col}`);
+        setLoading(true);
+        setError(null);
+
+        const CHUNK_SIZE = 50000;
+        let offset = 0;
+        let allValues: any[] = [];
+
+        try {
+            while (true) {
+                const chunk = await invoke<ColumnChunk>("load_column_chunk", {
+                    filepath,
+                    column: col,
+                    sheet: sheet ?? null,
+                    offset,
+                    limit: CHUNK_SIZE
+                });
+
+                allValues = allValues.concat(chunk.values);
+                
+                // Update state progressively for better UI feedback
+                setColumns(prev => ({ ...prev, [col]: allValues }));
+
+                if (chunk.done) {
+                    break;
+                }
+                offset += chunk.values.length;
+                await new Promise(r => setTimeout(r, 0)); // Yield to main thread
+            }
+            if (rowCount === null) {
+                setRowCount(allValues.length);
+            }
+        } catch (err: any) {
+            console.error(`Failed to load column ${col}:`, err);
+            setError(`Failed to load column "${col}": ${err}`);
+            // Rollback partial data on error
+            setColumns(prev => {
+                const newCols = {...prev};
+                delete newCols[col];
+                return newCols;
+            });
+        } finally {
+            setLoading(false);
+        }
+    }, [columns, rowCount]);
+
+	const handleCheckboxChange = async (col: string) => {
+        const isSelecting = !selectedColumns.includes(col);
+        
+        // Update selection immediately for responsive UI
 		setSelectedColumns((prev) =>
-			prev.includes(col) ? prev.filter((c) => c !== col) : [...prev, col]
+			isSelecting ? [...prev, col] : prev.filter((c) => c !== col)
 		);
+
+        if (isSelecting && currentFile && !columns[col]) {
+            await ensureColumnLoaded(currentFile, col, currentSheet);
+        }
 	};
+
+    const handleXAxisChange = async (col: string) => {
+        setXAxisColumn(col);
+        if (col !== "idx" && currentFile && !columns[col]) {
+            await ensureColumnLoaded(currentFile, col, currentSheet);
+        }
+    };
 
 	const pastelColors = [
-		"#AEC6CF",
-		"#FFB347",
-		"#B39EB5",
-		"#77DD77",
-		"#FF6961",
-		"#FDFD96",
-		"#CFCFC4",
-		"#FFD1DC",
-		"#B0E0E6",
-		"#E6E6FA",
+		"#AEC6CF", "#FFB347", "#B39EB5", "#77DD77", "#FF6961",
+		"#FDFD96", "#CFCFC4", "#FFD1DC", "#B0E0E6", "#E6E6FA",
 	];
 
-	const getChartOptions = () => {
-		return {
-			backgroundColor: "transparent",
-			animation: false,
-			tooltip: {
-				trigger: "axis",
-				backgroundColor: "rgba(30,30,30,0.8)",
-				borderColor: "transparent",
-				textStyle: { color: "#fff" },
-			},
-			legend: {
-				textStyle: { color: "#ccc" },
-			},
-			xAxis: {
-				type: "category",
-				data: fullData.map((row, idx) => row[xAxisColumn] ?? idx),
-				axisLine: { lineStyle: { color: "#555" } },
-				axisLabel: { color: "#ccc" },
-				splitLine: {
-					show: true,
-					lineStyle: {
-						color: "#ccc",
-						type: "dashed",
-					},
-				},
-			},
-			yAxis: {
-				type: "value",
-				axisLine: { lineStyle: { color: "#555" } },
-				axisLabel: { color: "#ccc" },
-				splitLine: {
-					show: true,
-					lineStyle: {
-						color: "#ccc",
-						type: "dashed",
-					},
-				},
-			},
-
-			series: selectedColumns.map((col, idx) => ({
-				name: col,
-				type: "line",
-				data: fullData.map((row) => row[col]),
-				smooth: false,
-				showSymbol: false,
-				lineStyle: {
-					width: 2,
-					color: pastelColors[idx % pastelColors.length],
-					opacity: finishedLoading ? 1 : 0.5,
-				},
-				itemStyle: {
-					color: pastelColors[idx % pastelColors.length], // Tooltip markers match this
-				},
-				emphasis: {
-					focus: "series",
-				},
-				progressive: 5000,
-				progressiveThreshold: 10000,
-			})),
-		};
-	};
+	const getChartOptions = () => ({
+		backgroundColor: "transparent",
+        animation: true,
+		tooltip: {
+			trigger: "axis",
+			backgroundColor: "rgba(30,30,30,0.8)",
+			borderColor: "transparent",
+			textStyle: { color: "#fff" },
+		},
+		legend: {
+			data: selectedColumns,
+			textStyle: { color: "#ccc" },
+		},
+		xAxis: {
+			type: "category",
+			data: xAxisColumn === "idx" 
+                ? (rowCount ? Array.from({ length: rowCount }, (_, i) => i + 1) : []) 
+                : (columns[xAxisColumn] ?? []),
+			axisLine: { lineStyle: { color: "#555" } },
+			axisLabel: { color: "#ccc" },
+			splitLine: { show: false },
+		},
+		yAxis: {
+			type: "value",
+			axisLine: { lineStyle: { color: "#555" } },
+			axisLabel: { color: "#ccc" },
+			splitLine: { show: true, lineStyle: { color: "rgba(204, 204, 204, 0.2)", type: "dashed" } },
+		},
+		series: selectedColumns.map((col, idx) => ({
+			name: col,
+			type: "line",
+			data: columns[col] ?? [],
+			smooth: false,
+			showSymbol: false,
+			lineStyle: { width: 2, color: pastelColors[idx % pastelColors.length] },
+			itemStyle: { color: pastelColors[idx % pastelColors.length] },
+			emphasis: { focus: "series" },
+			progressive: 10000,
+			progressiveThreshold: 20000,
+		})),
+		dataZoom: [
+			{ type: 'inside', start: 0, end: 100 },
+			{ start: 0, end: 100 },
+		],
+	});
 
 	return (
-		<div className="flex h-screen bg-gradient-to-br from-gray-900 to-gray-800 p-4 relative">
+		<div className="flex h-screen bg-gradient-to-br from-gray-900 to-gray-800 p-4 relative font-sans">
 			{/* Sidebar */}
-			<div className="w-1/4 p-4 backdrop-blur-md bg-white/10 rounded-2xl shadow-lg overflow-y-auto">
+			<div className="w-1/4 min-w-[250px] p-4 backdrop-blur-md bg-white/10 rounded-2xl shadow-lg overflow-y-auto flex flex-col">
 				<button
 					onClick={handleOpenFile}
-					className="w-full mb-6 p-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-white font-semibold"
+					disabled={loading}
+					className="w-full mb-6 p-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-white font-semibold transition-colors disabled:bg-gray-500 disabled:cursor-not-allowed"
 				>
-					Upload File
+					<div className="flex items-center justify-center">
+                        {loading && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>}
+                        {loading ? 'Loading...' : 'Upload File'}
+                    </div>
 				</button>
 
-				{finishedLoading && (
+				{headers.length > 0 && (
 					<>
-						<div className="text-white mb-4 font-semibold">
-							Select X-Axis:
-						</div>
+						<div className="text-white mb-4 font-semibold">Select X-Axis:</div>
 						<select
 							className="w-full mb-6 p-2 rounded-lg bg-gray-700 text-white border border-gray-600"
 							value={xAxisColumn}
-							onChange={(e) => setXAxisColumn(e.target.value)}
+							onChange={(e) => handleXAxisChange(e.target.value)}
 						>
-							<option value="idx">(Index)</option>
+							<option value="idx">(Row Index)</option>
 							{headers.map((col, idx) => (
-								<option key={idx} value={col}>
-									{col}
-								</option>
+								<option key={idx} value={col}>{col}</option>
 							))}
 						</select>
-						<div className="text-white mb-2 font-semibold">
-							Select Data Series:
-						</div>
-						{headers.map(
-							(col, idx) =>
+
+						<div className="text-white mb-2 font-semibold">Select Data Series (Y-Axis):</div>
+						<div className="flex-grow overflow-y-auto pr-2">
+							{headers.map((col, idx) =>
 								col !== xAxisColumn && (
-									<div
-										key={idx}
-										className="flex items-center mb-2"
-									>
+									<div key={idx} className="flex items-center mb-2">
 										<Checkbox
-											checked={selectedColumns.includes(
-												col
-											)}
-											onCheckedChange={() =>
-												handleCheckboxChange(col)
-											}
+											id={`col-${idx}`}
+											checked={selectedColumns.includes(col)}
+											onCheckedChange={() => handleCheckboxChange(col)}
 										/>
-										<span className="text-white ml-2">
-											{col}
-										</span>
+										<label htmlFor={`col-${idx}`} className="text-white ml-2 cursor-pointer">{col}</label>
 									</div>
 								)
-						)}
+							)}
+						</div>
 					</>
 				)}
 			</div>
 
 			{/* Chart area */}
-			<div className="w-3/4 p-4 relative">
+			<div className="w-3/4 p-4 pl-0 relative flex-1">
 				<Card className="h-full backdrop-blur-md bg-white/10 rounded-2xl shadow-lg">
 					<CardContent className="h-full flex flex-col p-4">
-						{/* Title at top */}
 						<div className="text-xl font-bold text-center text-white mb-4 transition-all duration-300">
 							{fileName}
 						</div>
-
-						{/* Chart area */}
-						<div className="flex-1 flex items-center justify-center">
-							{/* Chart or Upload Prompt */}
-							{fullData.length === 0 || loading ? (
+						<div className="flex-1 flex items-center justify-center min-h-0">
+							{loading && headers.length === 0 ? ( // Initial loading screen
+                                <div className="flex flex-col items-center text-gray-400">
+                                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-400 mb-4"></div>
+                                    <p className="text-lg">Processing, please wait...</p>
+                                </div>
+                            ) : error ? (
+                                <div className="text-red-400 text-center">
+                                    <p>An error occurred:</p>
+                                    <p className="text-sm font-mono mt-2">{error}</p>
+                                </div>
+                            ) : headers.length === 0 ? (
 								<div className="flex flex-col items-center justify-center text-gray-400 text-center">
-									<Upload
-										size={64}
-										className="text-blue-400 mb-4"
-									/>
-									<p className="text-lg">
-										{loading
-											? "Loading file..."
-											: "Upload an Excel or CSV file"}
-									</p>
+									<Upload size={64} className="text-blue-400 mb-4" />
+									<p className="text-lg">Upload an Excel or CSV file to begin</p>
 								</div>
 							) : (
 								<ReactECharts
 									style={{ height: "100%", width: "100%" }}
 									option={getChartOptions()}
-									notMerge={true}
+									notMerge={false} // Use notMerge: false to allow progressive data updates
 									lazyUpdate={true}
 								/>
 							)}
 						</div>
 					</CardContent>
 				</Card>
-
-				{/* Progress bar */}
-				{!finishedLoading && totalPoints > 0 && (
-					<div className="absolute bottom-4 left-4 right-4">
-						<div className="w-full h-2 bg-gray-700 rounded-full overflow-hidden">
-							<div
-								className="h-full bg-blue-500 transition-all duration-300"
-								style={{
-									width: `${
-										(loadingPoints / totalPoints) * 100
-									}%`,
-								}}
-							/>
-						</div>
-						<div className="text-center text-xs text-gray-400 mt-1">
-							{Math.min(
-								100,
-								Number(
-									(
-										(loadingPoints / totalPoints) *
-										100
-									).toFixed(1)
-								)
-							)}
-							% loaded
-						</div>
-					</div>
-				)}
 			</div>
 		</div>
 	);
