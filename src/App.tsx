@@ -31,6 +31,7 @@ interface ColumnFilter {
 }
 
 const FILTER_OPERATORS: FilterOperator[] = ["=", "!=", ">=", ">", "<=", "<"];
+const AUTO_SCALE_TARGET_FILL = 0.99;
 
 const toNumberIfPossible = (value: any): number | null => {
 	if (value === null || value === undefined) return null;
@@ -85,13 +86,19 @@ const getSeriesBounds = (values: any[]) => {
 
 	if (minValue === maxValue) {
 		const padding = Math.max(Math.abs(minValue), 1) * 0.08;
-		return { min: minValue - padding, max: maxValue + padding };
+		return {
+			min: minValue - padding,
+			max: maxValue + padding,
+		};
 	}
 
 	const range = maxValue - minValue;
-	const magnitudeFloor = Math.max(Math.abs(maxValue), Math.abs(minValue), 1);
-	const padding = Math.max(range * 0.12, magnitudeFloor * 0.02);
-	return { min: minValue - padding, max: maxValue + padding };
+	const extraRange = range * ((1 / AUTO_SCALE_TARGET_FILL) - 1);
+	const visualPadding = extraRange / 2;
+	return {
+		min: minValue - visualPadding,
+		max: maxValue + visualPadding,
+	};
 };
 
 const formatAxisTick = (value: any, maxSigFigs = 5) => {
@@ -347,6 +354,7 @@ export default function ExcelGraphApp() {
 			return [
 				{
 					type: "value",
+					scale: true,
 					axisLine: { lineStyle: { color: "rgba(193, 211, 224, 0.4)" } },
 					axisLabel: { color: "#c4d0dc", formatter: (value: number) => formatAxisTick(value) },
 					splitLine: { show: true, lineStyle: { color: "rgba(193, 211, 224, 0.18)", type: "dashed" } },
@@ -357,16 +365,16 @@ export default function ExcelGraphApp() {
 			return seriesWithData.map((series, idx) => {
 				const axisOnLeft = idx % 2 === 0;
 				const sideOffset = Math.floor(idx / 2) * 54;
-				return {
-					type: "value",
-					min: series.min,
-					max: series.max,
-					position: axisOnLeft ? "left" : "right",
-					offset: sideOffset,
-					alignTicks: true,
-					axisLine: { show: true, lineStyle: { color: series.color, width: 1.4 } },
-					axisLabel: { color: series.color, formatter: (value: number) => formatAxisTick(value) },
-					splitLine: { show: idx === 0, lineStyle: { color: "rgba(193, 211, 224, 0.18)", type: "dashed" } },
+					return {
+						type: "value",
+						scale: true,
+						min: series.min,
+						max: series.max,
+						position: axisOnLeft ? "left" : "right",
+						offset: sideOffset,
+						axisLine: { show: true, lineStyle: { color: series.color, width: 1.4 } },
+						axisLabel: { color: series.color, formatter: (value: number) => formatAxisTick(value) },
+						splitLine: { show: idx === 0, lineStyle: { color: "rgba(193, 211, 224, 0.18)", type: "dashed" } },
 				};
 			});
 		}, [multiAxisMode, seriesWithData]);
@@ -379,6 +387,7 @@ export default function ExcelGraphApp() {
 			yAxisIndex: multiAxisMode ? idx : 0,
 			smooth: false,
 			showSymbol: false,
+			clip: true,
 			lineStyle: { width: 2, color: series.color },
 			itemStyle: { color: series.color },
 			emphasis: { focus: "series" },
@@ -417,7 +426,7 @@ export default function ExcelGraphApp() {
 			xAxis: {
 				type: "category",
 				data: xAxisData,
-				axisLine: { lineStyle: { color: "rgba(193, 211, 224, 0.4)" } },
+				axisLine: { onZero: false, lineStyle: { color: "rgba(193, 211, 224, 0.4)" } },
 				axisLabel: { color: "#c4d0dc" },
 				splitLine: { show: false },
 			},
