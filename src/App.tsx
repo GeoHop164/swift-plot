@@ -3,8 +3,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import ReactECharts from "echarts-for-react";
-import { Upload } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { FolderOpen, Settings } from "lucide-react";
+import { useCallback, useMemo, useRef, useState } from "react";
 
 // --- New Data Contracts for On-Demand Loading ---
 
@@ -118,11 +118,12 @@ const formatAxisTick = (value: any, maxSigFigs = 5) => {
 };
 
 export default function ExcelGraphApp() {
-	const [fileName, setFileName] = useState<string>("Upload a Data File to Begin");
+	const [fileName, setFileName] = useState<string>("Open a Data File to Begin");
 	const [headers, setHeaders] = useState<string[]>([]);
 	const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
 	const [xAxisColumn, setXAxisColumn] = useState<string>("idx");
-	const [loading, setLoading] = useState<boolean>(false);
+	const [isInspecting, setIsInspecting] = useState<boolean>(false);
+	const [activeLoadCount, setActiveLoadCount] = useState<number>(0);
     const [error, setError] = useState<string | null>(null);
 
     // --- New State for On-Demand Loading ---
@@ -135,8 +136,65 @@ export default function ExcelGraphApp() {
 	const [filterOperator, setFilterOperator] = useState<FilterOperator>("=");
 	const [filterValue, setFilterValue] = useState<string>("");
 	const [autoScaleSeriesAxes, setAutoScaleSeriesAxes] = useState<boolean>(false);
+	const [skipFirstRow, setSkipFirstRow] = useState<boolean>(false);
+	const [configMenuOpen, setConfigMenuOpen] = useState<boolean>(false);
+
+	const loadGenerationRef = useRef<number>(0);
+	const isWorking = isInspecting || activeLoadCount > 0;
+
+	const clearLoadedData = useCallback(() => {
+		setHeaders([]);
+		setSelectedColumns([]);
+		setColumns({});
+		setRowCount(null);
+		setCurrentSheet(null);
+		setXAxisColumn("idx");
+		setFilters([]);
+		setFilterColumn("");
+		setFilterOperator("=");
+		setFilterValue("");
+	}, []);
+
+	const inspectFile = useCallback(async (
+		filepath: string,
+		shouldSkipFirstRow: boolean,
+		generation: number,
+	) => {
+		setIsInspecting(true);
+		setError(null);
+		clearLoadedData();
+
+		try {
+			const overview = await invoke<FileOverview>("open_file_overview", {
+				filepath,
+				skipFirstRow: shouldSkipFirstRow,
+			});
+
+			if (generation !== loadGenerationRef.current) {
+				return;
+			}
+
+			setHeaders(overview.headers);
+			setRowCount(overview.approx_rows ?? null);
+			setCurrentSheet(overview.sheets?.[0] ?? null);
+			setFilterColumn(overview.headers[0] ?? "");
+		} catch (err: any) {
+			if (generation !== loadGenerationRef.current) {
+				return;
+			}
+
+			console.error("Failed to get file overview:", err);
+			setError(typeof err === "string" ? err : "An unknown error occurred during file inspection.");
+			setFileName("Failed to load file. Please try again.");
+		} finally {
+			if (generation === loadGenerationRef.current) {
+				setIsInspecting(false);
+			}
+		}
+	}, [clearLoadedData]);
 
 	const handleOpenFile = async () => {
+		setConfigMenuOpen(false);
 		const selected = await open({
 			multiple: false,
 			filters: [{ name: "Excel or CSV", extensions: ["csv", "xlsx", "xls"] }],
@@ -146,44 +204,28 @@ export default function ExcelGraphApp() {
 			return; // User cancelled
 		}
 
-		setLoading(true);
-        setError(null);
+		const generation = loadGenerationRef.current + 1;
+		loadGenerationRef.current = generation;
 		const parts = selected.split(/[/\\]/);
 		const name = parts[parts.length - 1];
 		setFileName(name);
+		setCurrentFile(selected);
 
-        // Reset all data state
-        setHeaders([]);
-        setSelectedColumns([]);
-        setColumns({});
-        setRowCount(null);
-	        setCurrentFile(selected);
-	        setCurrentSheet(null);
-	        setXAxisColumn("idx");
-	        setFilters([]);
-	        setFilterColumn("");
-	        setFilterOperator("=");
-	        setFilterValue("");
+		await inspectFile(selected, skipFirstRow, generation);
+	};
 
-		try {
-			// 1. Invoke the new overview command
-			const overview = await invoke<FileOverview>("open_file_overview", {
-				filepath: selected,
-			});
-	            
-	            // 2. Update state with metadata
-				setHeaders(overview.headers);
-				setRowCount(overview.approx_rows ?? null);
-	            setCurrentSheet(overview.sheets?.[0] ?? null); // Default to first sheet for Excel
-	            setFilterColumn(overview.headers[0] ?? "");
+	const handleSkipFirstRowChange = (nextValue: boolean) => {
+		setSkipFirstRow(nextValue);
+		setConfigMenuOpen(false);
 
-		} catch (err: any) {
-			console.error("Failed to get file overview:", err);
-            setError(typeof err === 'string' ? err : "An unknown error occurred during file inspection.");
-            setFileName("Failed to load file. Please try again.");
-		} finally {
-			setLoading(false);
+		if (!currentFile) {
+			clearLoadedData();
+			return;
 		}
+
+		const generation = loadGenerationRef.current + 1;
+		loadGenerationRef.current = generation;
+		void inspectFile(currentFile, nextValue, generation);
 	};
 
     // Helper to load a full column from the backend in chunks
@@ -191,22 +233,32 @@ export default function ExcelGraphApp() {
         if (!filepath || columns[col]) return; // Already loaded or no file selected
 
         console.log(`Loading column: ${col}`);
-        setLoading(true);
+        setActiveLoadCount((count) => count + 1);
         setError(null);
 
         const CHUNK_SIZE = 50000;
+		const generation = loadGenerationRef.current;
         let offset = 0;
         let allValues: any[] = [];
 
         try {
             while (true) {
+				if (generation !== loadGenerationRef.current) {
+					return;
+				}
+
                 const chunk = await invoke<ColumnChunk>("load_column_chunk", {
                     filepath,
                     column: col,
                     sheet: sheet ?? null,
                     offset,
-                    limit: CHUNK_SIZE
+                    limit: CHUNK_SIZE,
+					skipFirstRow,
                 });
+
+				if (generation !== loadGenerationRef.current) {
+					return;
+				}
 
                 allValues = allValues.concat(chunk.values);
                 
@@ -223,6 +275,10 @@ export default function ExcelGraphApp() {
                 setRowCount(allValues.length);
             }
         } catch (err: any) {
+			if (generation !== loadGenerationRef.current) {
+				return;
+			}
+
             console.error(`Failed to load column ${col}:`, err);
             setError(`Failed to load column "${col}": ${err}`);
             // Rollback partial data on error
@@ -232,9 +288,9 @@ export default function ExcelGraphApp() {
                 return newCols;
             });
         } finally {
-            setLoading(false);
+			setActiveLoadCount((count) => Math.max(0, count - 1));
         }
-    }, [columns, rowCount]);
+    }, [columns, rowCount, skipFirstRow]);
 
 	const handleCheckboxChange = async (col: string) => {
         const isSelecting = !selectedColumns.includes(col);
@@ -461,16 +517,43 @@ export default function ExcelGraphApp() {
 			<div className="ambient-orb orb-3" />
 			<div className="app-layout">
 				<div className="glass-panel sidebar-panel">
-					<button
-						onClick={handleOpenFile}
-						disabled={loading}
-						className="btn btn-primary w-full"
-					>
-						<div className="flex items-center justify-center gap-2">
-							{loading && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>}
-							{loading ? "Loading..." : "Upload File"}
+					<div className="file-action-row">
+						<button
+							onClick={handleOpenFile}
+							className="btn btn-primary file-action-button"
+						>
+							<div className="flex items-center justify-center gap-2">
+								{isInspecting && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>}
+								{isInspecting ? "Opening..." : "Open File"}
+							</div>
+						</button>
+						<div className="config-menu-wrap">
+							<button
+								type="button"
+								className="config-menu-button"
+								aria-label="File load settings"
+								aria-expanded={configMenuOpen}
+								onClick={() => setConfigMenuOpen((open) => !open)}
+							>
+								<Settings size={18} />
+							</button>
+							{configMenuOpen && (
+								<div className="config-dropdown">
+									<div className="option-toggle">
+										<Checkbox
+											id="skip-first-row"
+											className={checkboxClassName}
+											checked={skipFirstRow}
+											onCheckedChange={(checked) => handleSkipFirstRowChange(checked === true)}
+										/>
+										<label htmlFor="skip-first-row" className="option-label">
+											Skip first row
+										</label>
+									</div>
+								</div>
+							)}
 						</div>
-					</button>
+					</div>
 
 					{headers.length > 0 ? (
 						<>
@@ -546,7 +629,7 @@ export default function ExcelGraphApp() {
 								<button
 									className="btn btn-secondary w-full mt-2"
 									onClick={handleAddFilter}
-									disabled={!filterColumn || filterValue.trim().length === 0 || loading}
+									disabled={!filterColumn || filterValue.trim().length === 0}
 								>
 									Add Filter
 								</button>
@@ -578,7 +661,7 @@ export default function ExcelGraphApp() {
 							</div>
 						</>
 					) : (
-						<p className="sidebar-hint">Upload a file to configure plotted series and filter rules.</p>
+						<p className="sidebar-hint">Open a file to configure plotted series and filter rules.</p>
 					)}
 				</div>
 
@@ -586,8 +669,14 @@ export default function ExcelGraphApp() {
 					<Card className="glass-panel chart-panel !gap-0 !py-0 !border-white/10 !bg-transparent !shadow-none">
 						<CardContent className="h-full flex flex-col p-5 md:p-6">
 							<div className="panel-title">{fileName}</div>
+							{isWorking && headers.length > 0 && (
+								<div className="loading-strip">
+									<div className="animate-spin rounded-full h-3 w-3 border-b-2 border-[#A8D3C9]"></div>
+									<span>Loading...</span>
+								</div>
+							)}
 							<div className="chart-host">
-								{loading && headers.length === 0 ? (
+								{isInspecting && headers.length === 0 ? (
 									<div className="loading-state">
 										<div className="animate-spin rounded-full h-12 w-12 border-b-2 border-[#A8D3C9] mb-4"></div>
 										<p className="text-lg">Processing, please wait...</p>
@@ -599,8 +688,8 @@ export default function ExcelGraphApp() {
 									</div>
 								) : headers.length === 0 ? (
 									<div className="empty-state">
-										<Upload size={64} className="empty-icon mb-4" />
-										<p className="text-lg">Upload an Excel or CSV file to begin</p>
+										<FolderOpen size={64} className="empty-icon mb-4" />
+										<p className="text-lg">Open an Excel or CSV file to begin</p>
 									</div>
 								) : (
 									<ReactECharts
